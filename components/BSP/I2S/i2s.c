@@ -1,12 +1,16 @@
 #include "i2s.h"
 #include <string.h>
 #include <stdlib.h>
+#include "esp_heap_caps.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "I2S";
 
-static QueueHandle_t s_pcm_queue = NULL;
-static TaskHandle_t s_mic_task = NULL;
-static bool s_mic_warmed = false;
+static QueueHandle_t pcm_queue = NULL;
+static StaticQueue_t pcm_queue_static;
+static uint8_t *pcm_queue_storage = NULL;
+static TaskHandle_t mic_task_handle = NULL;
+static bool mic_warmed = false;
 
 void init_i2s(void)
 {
@@ -55,7 +59,6 @@ void init_i2s(void)
         .data_out_num = I2S_PIN_NO_CHANGE
     };
 
-    /* 事件队列传 0/NULL：mic 数据走 i2s_read 直接读 DMA，不需要事件通知 */
     ESP_ERROR_CHECK(i2s_driver_install(I2S_NUM_1, &i2s_mic_config, 0, NULL));
     ESP_ERROR_CHECK(i2s_set_pin(I2S_NUM_1, &mic_pin_config));
 }
@@ -87,6 +90,21 @@ esp_err_t receive_audio(int16_t *buf, size_t len, size_t *bytes_read, TickType_t
     return ret;
 }
 
+static float spk_volume = 0.5f;
+
+void i2s_spk_set_volume(float vol)
+{
+    if (vol < 0.0f) vol = 0.0f;
+    if (vol > 1.0f) vol = 1.0f;
+    spk_volume = vol;
+    ESP_LOGI(TAG, "spk volume = %.2f", (double)spk_volume);
+}
+
+float i2s_spk_get_volume(void)
+{
+    return spk_volume;
+}
+
 esp_err_t send_audio(const int16_t *buf, size_t len, size_t *bytes_written, TickType_t ticks_to_wait)
 {
     if (buf == NULL || len == 0) 
@@ -97,7 +115,7 @@ esp_err_t send_audio(const int16_t *buf, size_t len, size_t *bytes_written, Tick
     const int16_t *out = buf;
     int16_t *vol_buf = NULL;
 
-    if (SPK_VOLUME < 1.0f) 
+    if (spk_volume < 0.99f) 
     {
         size_t samples = len / sizeof(int16_t);
         vol_buf = (int16_t *)malloc(len);
@@ -106,7 +124,7 @@ esp_err_t send_audio(const int16_t *buf, size_t len, size_t *bytes_written, Tick
         }
         for (size_t i = 0; i < samples; i++) 
         {
-            vol_buf[i] = (int16_t)(buf[i] * SPK_VOLUME);
+            vol_buf[i] = (int16_t)(buf[i] * spk_volume);
         }
         out = vol_buf;
     }
@@ -114,7 +132,7 @@ esp_err_t send_audio(const int16_t *buf, size_t len, size_t *bytes_written, Tick
     size_t total = 0;
     esp_err_t ret = ESP_OK;
 
-    /* 分块写，避免一次阻塞太久，给 WiFi 让出 CPU */
+    // 分块写入数据，每次写入 AUDIO_FRAME_BYTES ，避免一次阻塞太久，给 WiFi 让出 CPU
     while (total < len) 
     {
         size_t chunk = len - total;
@@ -146,16 +164,81 @@ esp_err_t send_audio(const int16_t *buf, size_t len, size_t *bytes_written, Tick
 
 QueueHandle_t i2s_get_pcm_queue(void)
 {
-    return s_pcm_queue;
+    return pcm_queue;
+}
+
+/* ── 异步播放 ── */
+typedef struct {
+    int16_t *buf;
+    size_t  len;
+    SemaphoreHandle_t done_sem;   /* 调用方等待播放完成 */
+} play_job_t;
+
+static QueueHandle_t play_queue = NULL;
+static TaskHandle_t player_task = NULL;
+static volatile bool spk_busy = false;   /* 播放中标志：判定扬声器是否在工作 */
+
+static void player_task_func(void *arg)
+{
+    (void)arg;
+    play_job_t job;
+
+    while (1) {
+        if (xQueueReceive(play_queue, &job, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        spk_busy = true;
+        send_audio(job.buf, job.len, NULL, portMAX_DELAY);
+        free(job.buf);
+        spk_busy = false;
+        if (job.done_sem) {
+            xSemaphoreGive(job.done_sem);
+        }
+    }
+}
+
+bool i2s_play_async(int16_t *buf, size_t len)
+{
+    if (!play_queue || !buf || len == 0) {
+        if (buf) free(buf);
+        return false;
+    }
+    play_job_t job = { .buf = buf, .len = len, .done_sem = NULL };
+    /* 播放是实时的：队列满时等玩家任务腾出槽位（最多 2s），
+     * 避免 TTS 音频因队列满被直接丢弃导致"有回复没声音"。 */
+    if (xQueueSend(play_queue, &job, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ESP_LOGW(TAG, "play queue full, drop %u bytes", (unsigned)len);
+        free(buf);
+        return false;
+    }
+    return true;
+}
+
+void i2s_play_wait_done(TickType_t timeout)
+{
+    if (!player_task) return;
+    SemaphoreHandle_t sem = xSemaphoreCreateBinary();
+    if (!sem) return;
+
+    play_job_t job = { .buf = NULL, .len = 0, .done_sem = sem };
+    xQueueSend(play_queue, &job, portMAX_DELAY);
+    xSemaphoreTake(sem, timeout);
+    vSemaphoreDelete(sem);
+}
+
+bool i2s_play_is_busy(void)
+{
+    if (!play_queue) return false;
+    return spk_busy || uxQueueMessagesWaiting(play_queue) > 0;
 }
 
 static bool pcm_queue_send(const audio_frame_t *frame)
 {
-    if (s_pcm_queue == NULL) {
+    if (pcm_queue == NULL) {
         return false;
     }
-    /* 超时 0：队列满则丢帧，避免 mic 堵死拖垮 WiFi */
-    if (xQueueSend(s_pcm_queue, frame, 0) != pdTRUE)
+    // 超时 0：队列满则丢帧，避免 mic 堵死拖垮 WiFi 
+    if (xQueueSend(pcm_queue, frame, 0) != pdTRUE)
     {
         ESP_LOGW(TAG, "pcm queue full, drop frame type=%d", (int)frame->type);
         return false;
@@ -163,10 +246,9 @@ static bool pcm_queue_send(const audio_frame_t *frame)
     return true;
 }
 
-/* 按键采集任务：按下读麦入 PCM 队列，松开发 END */
+// 按键采集任务：按下读麦入 PCM 队列，松开发 END 
 static void mic_task(void *arg)
 {
-    (void)arg;
     audio_frame_t frame;
     size_t bytes_read = 0;
     bool press = false;
@@ -187,7 +269,7 @@ static void mic_task(void *arg)
                 ESP_LOGI(TAG, "record end");
             }
             press = false;
-            s_mic_warmed = false;
+            mic_warmed = false;
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
@@ -196,17 +278,17 @@ static void mic_task(void *arg)
         {
             ESP_LOGI(TAG, "record start");
             press = true;
-            s_mic_warmed = false;
+            mic_warmed = false;
         }
 
-        if (!s_mic_warmed) 
+        if (!mic_warmed) 
         {
             int16_t dump[AUDIO_FRAME_SAMPLES];
             for (int i = 0; i < 4; i++) 
             {
                 receive_audio(dump, AUDIO_FRAME_BYTES, &bytes_read, pdMS_TO_TICKS(100));
             }
-            s_mic_warmed = true;
+            mic_warmed = true;
         }
 
         memset(&frame, 0, sizeof(frame));
@@ -224,24 +306,41 @@ static void mic_task(void *arg)
 
 esp_err_t i2s_audio_start(void)
 {
-    if (s_pcm_queue != NULL)
+    if (pcm_queue != NULL)
     {
         return ESP_OK;
     }
 
-    s_pcm_queue = xQueueCreate(PCM_QUEUE_LEN, sizeof(audio_frame_t));
-    if (s_pcm_queue == NULL)
+    size_t pcm_queue_bytes = PCM_QUEUE_LEN * sizeof(audio_frame_t);
+    pcm_queue_storage = heap_caps_malloc(pcm_queue_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (pcm_queue_storage) {
+        pcm_queue = xQueueCreateStatic(PCM_QUEUE_LEN, sizeof(audio_frame_t),
+                                       pcm_queue_storage, &pcm_queue_static);
+    }
+    if (pcm_queue == NULL)
     {
-        ESP_LOGE(TAG, "create pcm queue failed");
+        free(pcm_queue_storage);
+        pcm_queue_storage = NULL;
+        ESP_LOGE(TAG, "create PCM queue failed: %u bytes, internal=%u, spiram=%u",
+                 (unsigned)pcm_queue_bytes,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         return ESP_ERR_NO_MEM;
     }
 
-    if (xTaskCreate(mic_task, "mic", 4096, NULL, 5, &s_mic_task) != pdPASS)
-    {
-        ESP_LOGE(TAG, "create mic task failed");
-        return ESP_ERR_NO_MEM;
+    /* mic_task_handle 已由 AFE feed/fetch 替代，仅保留队列 */
+    mic_task_handle = NULL;
+
+    /* 异步播放队列 + 任务 */
+    if (play_queue == NULL) {
+        /* 队列够大：一次性 TTS 可能包含几十个小分片，避免 i2s_play_async 因
+         * 队列满丢音频（配合 i2s_play_async 内部 2s 阻塞等待更保险）。 */
+        play_queue = xQueueCreate(256, sizeof(play_job_t));
+        if (play_queue && player_task == NULL) {
+            xTaskCreate(player_task_func, "i2s_play", 4096, NULL, 18, &player_task);
+        }
     }
 
-    ESP_LOGI(TAG, "audio started: pcm_queue=%d frames", PCM_QUEUE_LEN);
+    ESP_LOGI(TAG, "pcm queue ready: %d frames (AFE mode)", PCM_QUEUE_LEN);
     return ESP_OK;
 }

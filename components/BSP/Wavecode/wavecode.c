@@ -1,7 +1,7 @@
 #include "wavecode.h"
 #include <string.h>
 
-/* 小端写入辅助 */
+// 小端写入辅助
 static void write_le16(uint8_t *p, uint16_t v)
 {
     p[0] = (uint8_t)(v & 0xFF);
@@ -34,26 +34,23 @@ int wav_build(uint8_t *out_buf,
 
     uint8_t *h = out_buf;
 
-    /* ---- RIFF chunk ---- */
     memcpy(h, "RIFF", 4);             h += 4;
-    write_le32(h, total - 8);         h += 4;   /* ChunkSize */
+    write_le32(h, total - 8);         h += 4; 
     memcpy(h, "WAVE", 4);             h += 4;
 
-    /* ---- fmt  sub-chunk ---- */
     memcpy(h, "fmt ", 4);             h += 4;
-    write_le32(h, 16);                h += 4;   /* Subchunk1Size (PCM=16) */
-    write_le16(h, 1);                 h += 2;   /* AudioFormat (PCM=1) */
+    write_le32(h, 16);                h += 4;
+    write_le16(h, 1);                 h += 2;
     write_le16(h, channels);          h += 2;
     write_le32(h, sr);                h += 4;
     write_le32(h, byterate);          h += 4;
-    write_le16(h, blk);               h += 2;   /* BlockAlign */
+    write_le16(h, blk);               h += 2;
     write_le16(h, bits);              h += 2;
 
-    /* ---- data sub-chunk ---- */
     memcpy(h, "data", 4);             h += 4;
-    write_le32(h, (uint32_t)pcm_bytes); h += 4; /* Subchunk2Size */
+    write_le32(h, (uint32_t)pcm_bytes); h += 4;
 
-    /* ---- PCM payload ---- */
+   
     memcpy(h, pcm, pcm_bytes);
 
     if (out_size) {

@@ -3,14 +3,22 @@ set(src_dirs
                 "I2S"
                 "AI_client"
                 "Wavecode"
-                "WIFI")
+                "WIFI"
+                "AFE_SR"
+                "KEY"
+                "MultiNet"
+                "LCD")
 
 set(include_dirs
                 "LED_Driver"
                 "I2S"
                 "AI_client"
                 "Wavecode"
-                "WIFI")
+                "WIFI"
+                "AFE_SR"
+                "KEY"
+                "MultiNet"
+                "LCD")
 
 set(requires
                 nvs_flash
@@ -23,7 +31,10 @@ set(requires
                 esp_timer
                 freertos
                 log
-                mbedtls)
+                mbedtls
+                esp-sr
+                esp_lcd
+                lvgl__lvgl)
 
 idf_component_register(SRC_DIRS ${src_dirs} INCLUDE_DIRS ${include_dirs} REQUIRES ${requires})
 component_compile_options(-ffast-math -O3 -Wno-error=format -Wno-format)

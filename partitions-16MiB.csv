@@ -1,7 +1,10 @@
 # ESP-IDF Partition Table
 # Name, Type, SubType, Offset, Size, Flags
+# 16MB dual-OTA layout: ota_0/ota_1 + esp-sr model + spiffs storage
 nvs,data,nvs,0x9000,0x6000,,
-phy_init,data,phy,0xf000,0x1000,,
-factory,app,factory,0x10000,0x1F0000,,
-vfs,data,fat,0x200000,0xA00000,,
-storage,data,spiffs,0xc00000,0x400000,,
+otadata,data,ota,0xf000,0x2000,,
+phy_init,data,phy,0x11000,0x1000,,
+ota_0,app,ota_0,0x20000,0x300000,,
+ota_1,app,ota_1,0x320000,0x300000,,
+model,data,,0x620000,0x500000,,
+storage,data,spiffs,0xB20000,0x4E0000,,

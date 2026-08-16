@@ -1,9 +1,10 @@
 ﻿#include "wifi.h"
+#include "lcd_ui.h"
 
 static EventGroupHandle_t wifi_event_group;
 const static char *TAG="wifi";
 uint8_t retry_num=1;
-uint8_t max_retry_num=5;
+uint8_t max_retry_num=100;
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -39,6 +40,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         retry_num=1;
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        esp_wifi_set_ps(WIFI_PS_NONE);   /* 关省电，减少延迟 */
     }
 }
 
@@ -69,21 +71,20 @@ void wifi_init_sta(void *pvParameters)
 
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_config));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-
+    //初始化WiFi配置
     wifi_config_t wifi_config={
     .sta={
         .password=WIFI_PASSWORD,
         .ssid=WIFI_ID
         }
     };
-    //初始化WiFi配置
-
+    
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
-
+    
     EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                            pdFALSE,  /* 不清除 bit，让 app_main 也能等到 */
@@ -97,7 +98,7 @@ void wifi_init_sta(void *pvParameters)
     else if(bits & WIFI_FAIL_BIT)
     {
         ESP_LOGI(TAG, "Failed to connect to AP: %s", WIFI_ID);
-        vTaskDelete(NULL);  /* 删除任务 */
+        vTaskDelete(NULL); 
     }
 
     while(1)
@@ -108,6 +109,7 @@ void wifi_init_sta(void *pvParameters)
 
 void wifi_connect()
 {
+    lcd_ui_set_status(LCD_STATUS_CONNECTING);
     esp_err_t ret=esp_wifi_connect();
     if(ret==ESP_OK)
     {

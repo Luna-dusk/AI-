@@ -55,6 +55,8 @@ void afe_sr_set_capture_enabled(bool enabled)
     }
     if (!enabled) {
         tail_samples = 0;
+        /* TTS 播放期间冻结双麦自适应，防止滤波锁到扬声器回灌声 */
+        i2s_dual_mic_set_adapt(false);
     } else {
         /* 复位 AFE 内部缓冲，丢弃 TTS 播放期间累积的回声 */
         if (afe_handle && afe_data) {
@@ -62,6 +64,9 @@ void afe_sr_set_capture_enabled(bool enabled)
             afe_handle->reset_buffer(afe_data);
             AFE_UNLOCK();
         }
+        /* 清双麦差分延迟线/DC，恢复自适应（权重保留，持续收敛） */
+        i2s_dual_mic_reset();
+        i2s_dual_mic_set_adapt(true);
         capture_warmup = 30;   /* ~1 s 冷却 */
         session_last_activity = xTaskGetTickCount();  /* 刷新会话活动时间 */
     }
@@ -316,6 +321,7 @@ static void afe_fetch_task(void *arg)
                     session_last_activity = xTaskGetTickCount();
                     /* 关闭采集：TTS 回复播放期间避免麦克风回灌触发 VAD 上传 */
                     capture_enabled = false;
+                    i2s_dual_mic_set_adapt(false);
                     lcd_ui_set_status(LCD_STATUS_REPLYING);
                     continue;
                 } else if (cmd == -1) {
@@ -363,11 +369,13 @@ static void afe_fetch_task(void *arg)
                         if (!end_queued) {
                             ESP_LOGW(TAG, "utterance aborted: END_FRAME unavailable");
                             capture_enabled = true;
+                            i2s_dual_mic_set_adapt(true);
                             lcd_ui_set_status(LCD_STATUS_LISTENING);
                             continue;
                         }
                         /* 立刻静音采集，等 main 播完 TTS 再打开 */
                         capture_enabled = false;
+                        i2s_dual_mic_set_adapt(false);
                         lcd_ui_set_status(LCD_STATUS_REPLYING);
                     }
                 } else {
@@ -380,6 +388,7 @@ static void afe_fetch_task(void *arg)
                                  (unsigned)diff, (unsigned)idle_timeout_ticks);
                         state = SR_IDLE;
                         capture_enabled = true;
+                        i2s_dual_mic_set_adapt(true);
                         enter_idle(data, &in_speech, &cur_hangover);
                     }
                 }

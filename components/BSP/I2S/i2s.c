@@ -12,6 +12,33 @@ static uint8_t *pcm_queue_storage = NULL;
 static TaskHandle_t mic_task_handle = NULL;
 static bool mic_warmed = false;
 
+/* ── 双麦自适应降噪状态（差分噪声参考 + 归一化 LMS）── */
+static int32_t ns_w[I2S_NS_TAP_NUM];         /* 自适应 FIR 权重（Q16） */
+static int16_t ns_delay[I2S_NS_TAP_NUM];     /* 差分参考 d 的延迟线 */
+static int32_t ns_dc_l = 0, ns_dc_r = 0;     /* 左右声道 DC 估计 */
+static volatile bool ns_adapt = true;        /* 采集打开时允许自适应 */
+static int16_t *ns_stereo = NULL;            /* 立体声读取缓冲 */
+static size_t ns_stereo_cap = 0;
+static int32_t ns_sat_count = 0;             /* 输出持续饱和计数：发散保护 */
+
+void i2s_dual_mic_reset(void)
+{
+    memset(ns_delay, 0, sizeof(ns_delay));
+    ns_dc_l = 0;
+    ns_dc_r = 0;
+    ns_sat_count = 0;
+    ns_adapt = true;
+    ESP_LOGI(TAG, "dual-mic NS: delay/DC reset, weights kept");
+}
+
+void i2s_dual_mic_set_adapt(bool on)
+{
+    if (ns_adapt != on) {
+        ESP_LOGI(TAG, "dual-mic NS adapt %s", on ? "ON" : "OFF");
+    }
+    ns_adapt = on;
+}
+
 void init_i2s(void)
 {
     i2s_config_t i2s_spk_config = {
@@ -42,7 +69,12 @@ void init_i2s(void)
         .mode = I2S_MODE_RX,
         .sample_rate = 16000,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+#if I2S_DUAL_MIC_NS_ENABLE
+        /* 双麦：两个 INMP441 共享 SD 线，靠 L/R 分左右声道，数据 L/R 交织 */
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+#else
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+#endif
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .dma_buf_count = 8,
         .dma_buf_len = 128,
@@ -61,6 +93,9 @@ void init_i2s(void)
 
     ESP_ERROR_CHECK(i2s_driver_install(I2S_NUM_1, &i2s_mic_config, 0, NULL));
     ESP_ERROR_CHECK(i2s_set_pin(I2S_NUM_1, &mic_pin_config));
+    ESP_LOGI(TAG, "mic I2S ready, dual-mic NS=%s (BCK=%d WS=%d SD=%d)",
+             I2S_DUAL_MIC_NS_ENABLE ? "ON" : "OFF",
+             (int)I2S_MIC_BCK_PIN, (int)I2S_MIC_WS_PIN, (int)I2S_MIC_DATAIN_PIN);
 }
 
 void boot_init(void)
@@ -77,10 +112,108 @@ void boot_init(void)
 
 esp_err_t receive_audio(int16_t *buf, size_t len, size_t *bytes_read, TickType_t ticks_to_wait)
 {
-    if (buf == NULL || len == 0) 
+    if (buf == NULL || len == 0 || (len % sizeof(int16_t)) != 0)
     {
         return ESP_ERR_INVALID_ARG;
     }
+
+#if I2S_DUAL_MIC_NS_ENABLE
+    /* len = 单声道输出字节数；立体声交织数据需要 2 倍字节 */
+    size_t need = len * 2;
+    if (ns_stereo == NULL || ns_stereo_cap < need) {
+        heap_caps_free(ns_stereo);
+        ns_stereo = (int16_t *)heap_caps_malloc(need, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (ns_stereo == NULL) {
+            ns_stereo_cap = 0;
+            ESP_LOGE(TAG, "dual-mic stereo buffer alloc failed (%u bytes)", (unsigned)need);
+            return ESP_ERR_NO_MEM;
+        }
+        ns_stereo_cap = need;
+    }
+
+    size_t real_bytes = 0;
+    esp_err_t ret = i2s_read(I2S_NUM_1, ns_stereo, need, &real_bytes, ticks_to_wait);
+    if (bytes_read)
+    {
+        *bytes_read = 0;
+    }
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
+
+    size_t pairs = real_bytes / (2 * sizeof(int16_t));
+    const int16_t *in = ns_stereo;
+    int16_t *out = buf;
+
+    for (size_t i = 0; i < pairs; i++) {
+        int32_t l = in[i * 2];
+        int32_t r = in[i * 2 + 1];
+
+        /* 单极点 DC 阻塞：去掉 INMP441 直流偏置（~16ms 时间常数） */
+        ns_dc_l += ((int32_t)l - ns_dc_l) / 256;
+        ns_dc_r += ((int32_t)r - ns_dc_r) / 256;
+        l -= ns_dc_l;
+        r -= ns_dc_r;
+
+        int32_t s = l + r;   /* 前方语音同时到达两麦：同相增强 */
+        int32_t d = l - r;   /* 前方语音抵消、扩散噪声保留：噪声参考 */
+
+        /* 自适应 FIR：用差分参考 d 估计 s 中与噪声相关的分量并减去 */
+        int64_t noise_est = 0;
+        for (int k = 0; k < I2S_NS_TAP_NUM; k++) {
+            noise_est += (int64_t)ns_w[k] * ns_delay[k];
+        }
+        int32_t e = (s >> 1) - (int32_t)(noise_est >> 16);
+        if (e > 32767) e = 32767;
+        else if (e < -32768) e = -32768;
+        out[i] = (int16_t)e;
+
+        /* 发散保护：输出长时间饱和说明权重跑飞，清零重建 */
+        if (e >= 16000 || e <= -16000) {
+            if (++ns_sat_count > 8000) {   /* 持续饱和 ~500ms */
+                memset(ns_w, 0, sizeof(ns_w));
+                ns_sat_count = 0;
+                ESP_LOGW(TAG, "dual-mic NS saturated, weights reset");
+            }
+        } else {
+            ns_sat_count = 0;
+        }
+
+        /* 滚动差分参考延迟线 */
+        for (int k = I2S_NS_TAP_NUM - 1; k > 0; k--) {
+            ns_delay[k] = ns_delay[k - 1];
+        }
+        ns_delay[0] = (int16_t)d;
+
+        /* 归一化 LMS：权重更新量 = mu*e*d/||d||^2，被归一化约束在很小值。
+         * 之前步长/权重上限过大，滤波器 1ms 内发散到削波，导致 VAD 永远
+         * 认为在说话（不出 END）、PCM 队列被噪声灌满。只在采集打开时更新，
+         * 防止锁到扬声器回灌的 TTS 声。 */
+        if (ns_adapt && I2S_NS_MU_Q16 > 0) {
+            int64_t ref_pow = 0;
+            for (int k = 0; k < I2S_NS_TAP_NUM; k++) {
+                ref_pow += (int64_t)ns_delay[k] * ns_delay[k];
+            }
+            if (ref_pow > 0) {
+                int64_t common = ((int64_t)I2S_NS_MU_Q16 * e) / (ref_pow + 1);
+                for (int k = 0; k < I2S_NS_TAP_NUM; k++) {
+                    int64_t upd = common * ns_delay[k];
+                    int64_t w = (int64_t)ns_w[k] + upd;
+                    if (w > I2S_NS_WEIGHT_MAX) w = I2S_NS_WEIGHT_MAX;
+                    else if (w < -I2S_NS_WEIGHT_MAX) w = -I2S_NS_WEIGHT_MAX;
+                    ns_w[k] = (int32_t)w;
+                }
+            }
+        }
+    }
+
+    if (bytes_read)
+    {
+        *bytes_read = pairs * sizeof(int16_t);
+    }
+    return ESP_OK;
+#else
     size_t real_byte = 0;
     esp_err_t ret = i2s_read(I2S_NUM_1, buf, len, &real_byte, ticks_to_wait);
     if (bytes_read)
@@ -88,6 +221,7 @@ esp_err_t receive_audio(int16_t *buf, size_t len, size_t *bytes_read, TickType_t
         *bytes_read = real_byte;
     }
     return ret;
+#endif
 }
 
 static float spk_volume = 0.5f;

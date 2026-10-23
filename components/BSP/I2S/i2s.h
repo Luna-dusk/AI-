@@ -19,10 +19,25 @@
 #define I2S_SPK_WS_PIN       16
 #define I2S_SPK_DATAOUT_PIN  7
 
-//INMP441 麦克风 (I2S_NUM_1 RX)
+// 双 INMP441 麦克风 (I2S_NUM_1 RX)
+// 两个麦共享 SCK/WS/SD 三根线，靠 L/R 引脚分左右声道：
+//   Mic1 L/R -> GND（左声道）  Mic2 L/R -> VDD（右声道）
+//   间距建议 5~8cm；SCK/WS 从 ESP32 先到 Mic1 再菊花链到 Mic2，尽量等长。
 #define I2S_MIC_BCK_PIN      5
 #define I2S_MIC_WS_PIN       4
-#define I2S_MIC_DATAIN_PIN   6
+#define I2S_MIC_DATAIN_PIN   6                         
+
+/* 双麦自适应降噪（差分噪声参考 + 归一化 LMS）
+ * 注意：当前置 0 = 单麦模式（只读左声道=Mic1，与加第二个麦之前一致）。
+ * 之前双麦音频持续产噪导致 VAD 永远不结束语句、无回复，疑似第二麦接线问题。
+ * 排查好第二麦接线后再置 1 恢复双麦；置 1 且 I2S_NS_MU_Q16=0 为纯平均 (L+R)/2。 */
+#define I2S_DUAL_MIC_NS_ENABLE   0
+#define I2S_NS_TAP_NUM           16     /* 自适应 FIR 抽头数（16kHz 下 1ms） */
+#define I2S_NS_MU_Q16            0      /* 自适应步长（Q16）。当前设为 0 = 纯平均 (L+R)/2，最稳。要恢复自适应改为 131(~0.002) */
+#define I2S_NS_WEIGHT_MAX        (1 << 18)   /* 权重上限（Q16，~4 倍于典型收敛值，防发散） */
+
+void i2s_dual_mic_reset(void); 
+void i2s_dual_mic_set_adapt(bool on);
 
 #define BTN_BOOT_PIN         0
 

@@ -1,3 +1,9 @@
+# 16MB flash with dual OTA + esp-sr model partition
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-16MiB.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions-16MiB.csv"
+
 # LVGL config for 240x240 ST7789
 CONFIG_LV_COLOR_DEPTH_16=y
 CONFIG_LV_COLOR_16_SWAP=n
@@ -15,3 +21,8 @@ CONFIG_LV_FONT_MONTSERRAT_28=y
 CONFIG_LV_FONT_MONTSERRAT_36=y
 CONFIG_LV_FONT_MONTSERRAT_48=y
 CONFIG_LV_FONT_SIMSUN_16_CJK=y
+
+# Raise lwIP TCP/IP thread priority above AFE fetch RNNT (pri 20),
+# otherwise RNNT hogs core0 during speech and starves tcpip thread,
+# socket send() blocks -> WS tx queue fills -> "PCM queue full".
+CONFIG_LWIP_TCPIP_TASK_PRIO=22

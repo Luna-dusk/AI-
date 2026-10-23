@@ -25,7 +25,10 @@
 
 static const char *TAG = "RAW_WS";
 
-#define RAW_WS_TX_QUEUE_LEN       96
+#define RAW_WS_TX_QUEUE_LEN       512
+/* PCM/end 帧入队超时：瞬时拥塞时短等发送任务排空，而不是立刻丢帧/判失败 */
+#define RAW_WS_TX_BLOCK_MS        500
+#define RAW_WS_END_BLOCK_MS       500
 /*
  * A real TTS reply is base64 of seconds of 16 kHz/16-bit mono audio.  The HTTP
  * fallback path already accepts up to 512 KiB of decoded PCM, i.e. about 683 KiB
@@ -37,8 +40,9 @@ static const char *TAG = "RAW_WS";
 #define RAW_WS_RX_BUFFER_SIZE     (RAW_WS_TEXT_MAX + 32 * 1024)
 #define RAW_WS_HTTP_HEADER_MAX    4096
 #define RAW_WS_CONNECT_TIMEOUT_MS 8000
-#define RAW_WS_RECV_TIMEOUT_MS    50
-#define RAW_WS_SEND_TIMEOUT_MS    2000
+#define RAW_WS_RECV_TIMEOUT_MS    10
+#define RAW_WS_SEND_TIMEOUT_MS    500
+#define RAW_WS_DRAIN_MAX_US       20000   /* 单次循环排空发送队列的时间上限 */
 #define RAW_WS_PING_INTERVAL_US   (20LL * 1000 * 1000)
 #define RAW_WS_PONG_TIMEOUT_US    (35LL * 1000 * 1000)
 
@@ -64,6 +68,7 @@ static volatile bool ws_stream_has_tts;
 static char ws_reply[2048];
 static volatile bool ws_reply_ready;
 static char ws_result_buf[1024];
+static ws_text_cb_t ws_text_cb = NULL;
 
 static uint8_t *ws_rx_buffer;
 static size_t ws_rx_len;
@@ -129,7 +134,12 @@ static int ws_set_timeouts(int fd)
         .tv_sec = RAW_WS_SEND_TIMEOUT_MS / 1000,
         .tv_usec = (RAW_WS_SEND_TIMEOUT_MS % 1000) * 1000,
     };
-    return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
+    int nodelay = 1;
+    /* 流式发送的是 256 字节小帧，必须关掉 Nagle 算法：否则每帧都要等上一个
+     * ACK 才发（1 RTT/帧），RTT>16ms 时吞吐就低于 16KB/s 的音频生产速率，
+     * TCP 发送缓冲被堵死 -> raw_ws 卡在 send() -> "PCM queue full"。 */
+    return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) == 0 &&
+           setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
                       sizeof(receive_timeout)) == 0 &&
            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout,
                       sizeof(send_timeout)) == 0 ? 0 : -1;
@@ -254,9 +264,19 @@ static int ws_read_http_headers(int fd)
         if (!end) continue;
 
         size_t header_len = (size_t)(end + 4 - ws_http_headers);
+        /* 记录状态行：HTTP/1.1 101 才是握手成功；404/401/502 等都会导致
+         * WS 建不起来、网页端显示离线，必须能一眼看到原因。 */
+        {
+            char status_line[80];
+            size_t sl = strcspn(ws_http_headers, "\r\n");
+            if (sl >= sizeof(status_line)) sl = sizeof(status_line) - 1;
+            memcpy(status_line, ws_http_headers, sl);
+            status_line[sl] = '\0';
+            ESP_LOGI(TAG, "WS upgrade status: %s", status_line);
+        }
         if (strncmp(ws_http_headers, "HTTP/1.1 101", 12) != 0 &&
             strncmp(ws_http_headers, "HTTP/1.0 101", 12) != 0) {
-            ESP_LOGW(TAG, "Upgrade rejected: %.80s", ws_http_headers);
+            ESP_LOGW(TAG, "Upgrade rejected: %.120s", ws_http_headers);
             return -1;
         }
         ws_rx_len = used - header_len;
@@ -353,6 +373,7 @@ static void ws_handle_text(const char *text)
         ESP_LOGW(TAG, "invalid text frame");
         return;
     }
+    if (ws_text_cb) ws_text_cb(type, text);
 
     if (strcmp(type, "ready") == 0) {
         ws_connected = true;
@@ -397,7 +418,11 @@ static void ws_handle_text(const char *text)
         ws_stream_active = false;
         if (ws_done_sem) xSemaphoreGive(ws_done_sem);
         ESP_LOGI(TAG, "stream done");
+        return;
     }
+    /* 未知消息类型（settings/chat/config…）：以前直接丢弃，网页端下发
+     * 设置固件毫无反应也查不到原因。现在记录完整消息供排查。 */
+    ESP_LOGW(TAG, "unhandled WS message type=%s: %.200s", type, text);
 }
 
 static void ws_handle_frame(uint8_t opcode, bool fin, const uint8_t *payload, size_t len)
@@ -558,11 +583,8 @@ static void raw_ws_task(void *arg)
     char request[512];
     int request_len;
 
-    uint8_t mac[6];
     char device_key[18];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    snprintf(device_key, sizeof(device_key), "%02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    device_key_str(device_key, sizeof(device_key));
 
     request_len = snprintf(request, sizeof(request),
         "GET %s HTTP/1.1\r\nHost: %s%s%d\r\nUpgrade: websocket\r\n"
@@ -591,6 +613,10 @@ static void raw_ws_task(void *arg)
     ESP_LOGI(TAG, "Upgrade complete, waiting for server ready");
     while (!ws_stop) {
         raw_ws_tx_t message;
+        /* 排空发送队列必须设时间上限：若 TCP 发送变慢而新 PCM 帧持续入队，
+         * 无上限的紧循环会让本任务永远困在这里，ping/pong/recv/断连检测
+         * 全部失效，坏连接退化成僵尸。每轮最多排 20ms，随后回到 keepalive。 */
+        int64_t drain_deadline = esp_timer_get_time() + RAW_WS_DRAIN_MAX_US;
         while (xQueueReceive(ws_tx_queue, &message, 0) == pdTRUE) {
             int send_result = ws_send_frame(fd, message.opcode, message.data, message.len);
             free(message.data);
@@ -599,6 +625,7 @@ static void raw_ws_task(void *arg)
                 ws_signal_failure();
                 goto close_socket;
             }
+            if (esp_timer_get_time() > drain_deadline) break;
         }
 
         if (ws_consume_frames() != 0) {
@@ -643,6 +670,11 @@ exit:
     vTaskDelete(NULL);
 }
 
+void ws_client_set_text_cb(ws_text_cb_t cb)
+{
+    ws_text_cb = cb;
+}
+
 int ws_client_init(void)
 {
     if (ws_connected) return 0;
@@ -665,12 +697,14 @@ int ws_client_init(void)
     ws_frag_opcode = 0;
     ws_frag_len = 0;
 
-    if (xTaskCreate(raw_ws_task, "raw_ws", 6144, NULL, 5, &ws_task_handle) != pdPASS) {
+    if (xTaskCreatePinnedToCore(raw_ws_task, "raw_ws", 6144, NULL, 8,
+                                &ws_task_handle, 1) != pdPASS) {
         ws_task_handle = NULL;
         return -1;
     }
     if (xSemaphoreTake(ws_ready_sem, pdMS_TO_TICKS(10000)) != pdTRUE || !ws_connected) {
-        ESP_LOGW(TAG, "server did not send ready");
+        ESP_LOGW(TAG, "WS ready 超时：服务器 10s 内未下发 {\"type\":\"ready\"}，"
+                      "退回 HTTP 模式（网页端将显示离线、设置无法下发）");
         ws_client_deinit();
         return -1;
     }
@@ -698,7 +732,7 @@ int ws_client_send_pcm(const uint8_t *pcm_data, int pcm_len)
     if (!copy) return -1;
     memcpy(copy, pcm_data, (size_t)pcm_len);
     raw_ws_tx_t message = { .opcode = 0x02, .len = (uint16_t)pcm_len, .data = copy };
-    if (xQueueSend(ws_tx_queue, &message, 0) != pdTRUE) {
+    if (xQueueSend(ws_tx_queue, &message, pdMS_TO_TICKS(RAW_WS_TX_BLOCK_MS)) != pdTRUE) {
         free(copy);
         ESP_LOGW(TAG, "PCM queue full");
         return -1;
@@ -734,7 +768,7 @@ int ws_client_send_end(void)
     if (!copy) return -1;
     memcpy(copy, end_message, sizeof(end_message) - 1);
     raw_ws_tx_t message = { .opcode = 0x01, .len = sizeof(end_message) - 1, .data = copy };
-    if (xQueueSend(ws_tx_queue, &message, 0) != pdTRUE) {
+    if (xQueueSend(ws_tx_queue, &message, pdMS_TO_TICKS(RAW_WS_END_BLOCK_MS)) != pdTRUE) {
         free(copy);
         ws_stream_failed = true;
         ws_stream_active = false;

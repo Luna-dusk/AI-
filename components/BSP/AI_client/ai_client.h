@@ -16,6 +16,11 @@
 #define WS_SERVER_URL   "ws://81.71.24.233/ws"
 #define HEARTBEAT_URL   "http://81.71.24.233/manage-api/devices/heartbeat"
 #define DEVICE_NAME     "小阁-01"
+/* 设备标识：必须与网页端绑定记录里的设备标识逐字符一致。
+ * 当前与网页端一致，固定为 ESP32-S3-001。网页端换绑时只改这一处。 */
+#define DEVICE_KEY      "ESP32-S3-001"
+
+void device_key_str(char *buf, size_t sz);
 
 /* 文本对话（原有接口） */
 int ai_client_send_request(const char *post_data, char *response_buf, int buf_size);
@@ -97,5 +102,13 @@ int ws_client_wait_done(TickType_t timeout);
  * 返回文本指针（静态缓冲区），如果还没收到返回 NULL。
  */
 const char *ws_client_get_reply(void);
+
+/*
+ * 服务器推送回调：所有 WS 文本消息（解析出 type 后）都会调用。
+ * 内部类型 ready/reply/tts/done 已由 raw_ws 处理；main 侧用它接收
+ * settings/chat 等网页端下发的消息（之前固件完全没有这个入口）。
+ */
+typedef void (*ws_text_cb_t)(const char *type, const char *json);
+void ws_client_set_text_cb(ws_text_cb_t cb);
 
 #endif /* AI_CLIENT_H */

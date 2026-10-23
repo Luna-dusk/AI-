@@ -4,6 +4,9 @@
 #include "i2s.h"
 #include "esp_timer.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 static const char *TAG = "AI_CLIENT";
 
 static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
@@ -33,6 +36,14 @@ static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
     }
     return ESP_OK;
 }
+
+/* 生成设备标识：与网页端绑定记录的设备标识逐字符一致（全工程唯一实现） */
+void device_key_str(char *buf, size_t sz)
+{
+    if (!buf || sz < 1) return;
+    snprintf(buf, sz, "%s", DEVICE_KEY);
+}
+
 // 文本对话接口
 int ai_client_send_request(const char *post_data, char *response_buf, int buf_size)
 {
@@ -121,11 +132,8 @@ static int ai_client_upload_asr_url(const char *url,
     esp_http_client_set_method(client, HTTP_METHOD_POST);
     esp_http_client_set_header(client, "Content-Type", "audio/wav");
 
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
     char device_key[18];
-    snprintf(device_key, sizeof(device_key), "%02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    device_key_str(device_key, sizeof(device_key));
     esp_http_client_set_header(client, "X-Device-Key", device_key);
 
     esp_err_t err = esp_http_client_open(client, wav_len);
@@ -219,17 +227,13 @@ int ai_client_upload_asr(const uint8_t *wav_data, int wav_len,
 
 int ai_client_heartbeat(void)
 {
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-
-    char mac_str[18];
-    snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    char device_key[18];
+    device_key_str(device_key, sizeof(device_key));
 
     char payload[256];
     snprintf(payload, sizeof(payload),
              "{\"device_key\":\"%s\",\"name\":\"" DEVICE_NAME "\",\"firmware_version\":\"v1.0\"}",
-             mac_str);
+             device_key);
 
     esp_http_client_config_t config = {
         .url = HEARTBEAT_URL,
@@ -253,20 +257,63 @@ int ai_client_heartbeat(void)
         return -1;
     }
 
-    esp_http_client_write(client, payload, post_len);
-    esp_http_client_fetch_headers(client);
+    int wlen = esp_http_client_write(client, payload, post_len);
+    if (wlen < 0) {
+        ESP_LOGE(TAG, "心跳: 发送数据失败");
+        esp_http_client_cleanup(client);
+        return -1;
+    }
 
+    esp_http_client_fetch_headers(client);
     int status = esp_http_client_get_status_code(client);
+
+    /*
+     * 修复：原来只判断 HTTP 200，29 字节的业务响应体被直接丢弃，
+     * 服务器返回业务错误（HTTP 200 + {"code":401,...}）时固件无从得知，
+     * 误报"心跳成功"。这里把响应体读出来解析并记录。
+     */
+    char body[256];
+    int blen = 0;
+    if (status == 200) {
+        blen = esp_http_client_read_response(client, body, sizeof(body) - 1);
+        if (blen > 0) body[blen] = '\0';
+    }
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
-    if (status == 200) {
-        ESP_LOGI(TAG, "心跳成功: MAC=%s", mac_str);
-        return 0;
-    } else {
+    if (status != 200) {
         ESP_LOGW(TAG, "心跳失败: HTTP %d", status);
         return -1;
     }
+
+    int business_fail = 0;
+    if (blen > 0) {
+        ESP_LOGI(TAG, "心跳响应(%d字节): %s", blen, body);
+        /* {"code":0/200}=成功；{"code":非0}=业务失败；{"success":false}=失败 */
+        const char *code = strstr(body, "\"code\"");
+        if (code) {
+            const char *p = code + strlen("\"code\"");
+            while (*p == ' ' || *p == ':' || *p == '\t') p++;
+            long v = strtol(p, NULL, 10);
+            if (v != 0 && v != 200) {
+                business_fail = 1;
+                ESP_LOGW(TAG, "心跳业务失败: code=%ld", v);
+            }
+        } else if (strstr(body, "success") && strstr(body, "false")) {
+            business_fail = 1;
+            ESP_LOGW(TAG, "心跳业务失败: success=false");
+        }
+    } else {
+        ESP_LOGW(TAG, "心跳: HTTP 200 但无响应体（服务器未确认，可能未匹配到设备）");
+    }
+
+    if (business_fail) {
+        ESP_LOGW(TAG, "心跳失败: 设备 key=%s", device_key);
+        return -1;
+    }
+
+    ESP_LOGI(TAG, "心跳成功: MAC=%s", device_key);
+    return 0;
 }
 
 /* 本地命令 TTS 回复：POST {"cmd": id}，返回含 reply + base64 WAV 的 JSON */

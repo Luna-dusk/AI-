@@ -1,5 +1,6 @@
 ﻿#include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -18,6 +19,10 @@
 
 static const char *TAG = "MAIN";
 static bool ws_online = false;
+/* 正在采集一句话：置位期间 ws_reconnect_task 不得把 ws_online 翻回 true，
+ * 否则 WS 发送失败切到 HTTP 兜底后，会在同一句话中途被重连任务恢复成
+ * 流式模式，导致 WS/HTTP 反复横跳、PCM 帧全丢、永远收不到回复。 */
+static volatile bool audio_in_utterance = false;
 
 #define PCM_BUF_SIZE      (320 * 1024)
 #define RESP_BUF_INIT     4096
@@ -174,8 +179,11 @@ static void process_tts_response(const char *json, int json_len)
 
     uint8_t *tts_pcm = NULL; size_t tts_pcm_size = 0;
     if (tts_b64 && tts_b64_len > 0) {
-        tts_pcm = (uint8_t *)heap_caps_malloc(TTS_BUF_SIZE, MALLOC_CAP_SPIRAM);
-        if (tts_pcm && mbedtls_base64_decode(tts_pcm, TTS_BUF_SIZE,
+        /* 按 base64 长度动态分配解码缓冲，避免固定 512KB 上限导致
+         * 长回复（解码后 >512KB）解码失败 -> 有文本没声音。 */
+        size_t cap = tts_b64_len / 4 * 3 + 4;
+        tts_pcm = (uint8_t *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+        if (tts_pcm && mbedtls_base64_decode(tts_pcm, cap,
                  &tts_pcm_size, (const uint8_t *)tts_b64, tts_b64_len) != 0) {
             free(tts_pcm); tts_pcm = NULL;
         }
@@ -236,7 +244,7 @@ static void ws_reconnect_task(void *arg)
                 ws_online = true;
                 ESP_LOGI(TAG, "WS reconnected (streaming mode)");
             }
-        } else if (!ws_online) {
+        } else if (!ws_online && !audio_in_utterance) {
             ws_online = true;
             ESP_LOGI(TAG, "WS stream mode restored");
         }
@@ -257,6 +265,7 @@ static void audio_process_task(void *arg)
         if (xQueueReceive(q, &frame, portMAX_DELAY) != pdTRUE) continue;
 
         if (frame.type == AUDIO_FRAME_DATA) {
+            audio_in_utterance = true;
             if (pcm_pos + frame.bytes <= PCM_BUF_SIZE) {
                 memcpy(pcm_buf + pcm_pos, frame.data, frame.bytes);
                 pcm_pos += frame.bytes;
@@ -268,6 +277,7 @@ static void audio_process_task(void *arg)
             continue;
         }
         if (frame.type != AUDIO_FRAME_END) continue;
+        audio_in_utterance = false;
 
         ESP_LOGI(TAG, "audio end: pcm=%u, ws=%d", (unsigned)pcm_pos, ws_online);
 
@@ -348,6 +358,35 @@ static void audio_process_task(void *arg)
     }
 }
 
+/* 服务器经 WS 下发的所有文本消息（settings/chat 等）都会到这里。
+ * 之前固件没有这个入口，网页端改 AI 设置、推送聊天，固件一概无反应。 */
+static void on_server_text(const char *type, const char *json)
+{
+    /* 内部消息已由 raw_ws_client 处理 */
+    if (strcmp(type, "ready") == 0 || strcmp(type, "reply") == 0 ||
+        strcmp(type, "tts") == 0 || strcmp(type, "done") == 0) {
+        return;
+    }
+    ESP_LOGI(TAG, "服务器下发 type=%s: %.200s", type, json);
+
+    /* 示例：{"type":"settings","volume":0.8} 网页端音量设置下发 */
+    if (strcmp(type, "settings") == 0) {
+        const char *v = strstr(json, "\"volume\"");
+        if (v) {
+            const char *p = v + strlen("\"volume\"");
+            while (*p == ' ' || *p == ':' || *p == '\t') p++;
+            float vol = strtof(p, NULL);
+            if (vol >= 0.0f && vol <= 1.0f) {
+                i2s_spk_set_volume(vol);
+                ESP_LOGI(TAG, "已应用服务器音量设置: %.2f", (double)vol);
+            } else {
+                ESP_LOGW(TAG, "服务器音量值非法: %f", (double)vol);
+            }
+        }
+    }
+    /* 其它设置类型：按服务器实际协议在此扩展 */
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "=== XiaoGe Starting, reset_reason=%d ===", esp_reset_reason());
@@ -363,6 +402,13 @@ void app_main(void)
     while ((evt = wifi_get_event_group()) == NULL) vTaskDelay(pdMS_TO_TICKS(10));
     xEventGroupWaitBits(evt, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
     ESP_LOGI(TAG, "WiFi ready");
+
+    {
+        char dk[18];
+        device_key_str(dk, sizeof(dk));
+        ESP_LOGI(TAG, "Device key: %s  (请与网页端绑定记录的设备标识逐字符核对)", dk);
+    }
+    ws_client_set_text_cb(on_server_text);
 
     xTaskCreate(heartbeat_task, "heartbeat", 4096, NULL, 2, NULL);
     xTaskCreate(ws_reconnect_task, "ws_reconn", 3072, NULL, 2, NULL);

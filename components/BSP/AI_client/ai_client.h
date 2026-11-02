@@ -9,13 +9,13 @@
 #include "freertos/semphr.h"
 #include "esp_mac.h"
 
-#define SERVER_URL      "http://81.71.24.233/api/chat"
-#define ASR_SERVER_URL  "http://81.71.24.233/api/asr"
-#define ASR_SERVER_URL_FALLBACK "http://81.71.24.233/asr"
-#define CMD_TTS_URL     "http://81.71.24.233/api/cmd_tts"
-#define WS_SERVER_URL   "ws://81.71.24.233/ws"
-#define HEARTBEAT_URL   "http://81.71.24.233/manage-api/devices/heartbeat"
-#define DEVICE_NAME     "小阁-01"
+#define SERVER_URL      ""
+#define ASR_SERVER_URL  ""
+#define ASR_SERVER_URL_FALLBACK ""
+#define CMD_TTS_URL     ""
+#define WS_SERVER_URL   ""
+#define HEARTBEAT_URL   ""
+#define DEVICE_NAME     ""
 /* 设备标识：必须与网页端绑定记录里的设备标识逐字符一致。
  * 当前与网页端一致，固定为 ESP32-S3-001。网页端换绑时只改这一处。 */
 #define DEVICE_KEY      "ESP32-S3-001"

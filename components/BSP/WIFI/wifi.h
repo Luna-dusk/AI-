@@ -12,8 +12,8 @@
 #include "esp_err.h"
 
 
-#define WIFI_ID "月色真美" //建议使用英文
-#define WIFI_PASSWORD "zhaohuaxishi"//密码长度：8~63位
+#define WIFI_ID "" //建议使用英文
+#define WIFI_PASSWORD ""//密码长度：8~63位
 
 #define WIFI_CONNECTED_BIT BIT(0) //WiFi 连接成功标志位
 #define WIFI_FAIL_BIT      BIT(1) //WiFi 连接失败标志位
